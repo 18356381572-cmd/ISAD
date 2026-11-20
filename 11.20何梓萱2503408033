@@ -1,0 +1,385 @@
+# 古籍文献数字化平台｜作业完整答案（可直接放进md提交）
+## 问题1：面向服务设计
+### 1. 服务边界划分 & 服务清单
+> 区分：**基础能力服务（通用、可复用底层能力）、业务服务（古籍专属业务）、编排服务（流程组装）**
+#### 基础能力服务（通用，可被外部复用）
+1. 文件存储服务：古籍大图上传、访问、删除，文件元信息管理
+2. OCR识别服务：图片文字识别，独立能力，可替换OCR引擎
+3. 实体抽取标注服务：识别人名、地名实体，支持标注增删改查
+4. 身份权限服务：用户认证、权限校验（开放/校内/涉密三级权限判断）
+5. 操作日志服务：统一记录操作留痕，写入谁、何时、修改哪条记录
+6. 检索引擎服务：全文检索、条件检索
+
+#### 业务服务（古籍业务专属）
+1. 古籍著录服务：古籍元数据新增、编辑、审核
+2. 标注审核服务：研究人员标注提交、管理员审核标注结果
+3. 数据集导出服务：按专题筛选，导出数据集
+4. 古籍浏览服务：按权限控制古籍浏览、预览
+5. 资源类型管理服务：支持后续新增方志、族谱资源类型
+
+#### 编排服务（流程编排，调用上面的服务组装业务流程）
+1. 古籍上传编排服务：上传影像 → 调用存储服务 → 触发OCR任务 → 写入古籍元数据
+2. 标注流程编排服务：OCR结果加载 → 实体标注 → 提交审核 → 日志留痕
+
+---
+### 2. 任选2个服务写接口契约（JSON）
+#### 服务①：OCR识别服务（基础能力服务）
+**服务职责**：接收古籍影像文件，返回识别文本；无业务耦合，支持更换OCR引擎
+入参（JSON）
+```json
+{
+  "taskId": "string",
+  "fileUrl": "string",
+  "imgHash": "string",
+  "callbackUrl": "string"
+}
+```
+出参（JSON）
+```json
+{
+  "code": 200,
+  "msg": "success",
+  "data": {
+    "ocrText": "string",
+    "confidence": 0.92,
+    "taskId": "string"
+  }
+}
+```
+异常返回
+```json
+{
+  "code": 5001,
+  "msg": "OCR引擎识别失败",
+  "data": {
+    "taskId": "string",
+    "reason": "图片模糊/格式不支持"
+  }
+}
+```
+
+#### 服务②：古籍著录服务（业务服务）
+**服务职责**：古籍元数据新增/修改，权限校验，自动写入操作日志
+入参（JSON）
+```json
+{
+  "ancientBookId": "string",
+  "bookName": "string",
+  "author": "string",
+  "publishYear": "string",
+  "securityLevel": "open|campus|secret",
+  "uploadUserId": "string"
+}
+```
+出参（JSON）
+```json
+{
+  "code": 200,
+  "msg": "success",
+  "data": {
+    "ancientBookId": "string",
+    "updateTime": "2026-11-20 18:00:00"
+  }
+}
+```
+异常返回
+```json
+{
+  "code": 4031,
+  "msg": "权限不足，无法编辑涉密古籍",
+  "data": {
+    "userId": "string",
+    "securityLevel": "secret"
+  }
+}
+```
+
+### 3. 解耦方案 + 同步/异步调用场景说明
+#### ✅ 服务解耦方式
+1. **接口契约化**：所有服务通过标准JSON接口通信，不直接依赖内部数据库；OCR、存储等服务对外只暴露接口，内部实现可替换
+2. **数据分离**：影像、OCR文本、元数据分开存储；服务只依赖对方接口，不共享数据表
+3. **依赖倒置**：编排服务调用基础服务，基础服务不感知上层古籍业务；OCR、实体标注可以给别的系统复用
+4. **通过消息队列做异步解耦**，避免长任务阻塞主流程
+
+#### ✅ 同步调用场景
+适合**实时、强一致性、需要立刻拿到结果**：
+- 用户登录鉴权、权限校验、古籍元数据查询、浏览权限判断
+理由：用户等待响应短，必须马上知道是否有权限、查询结果，适合同步HTTP调用。
+
+#### ✅ 消息队列异步调用场景
+适合**耗时较长、允许后台慢慢执行、不需要用户等待**：
+- 古籍大图上传后自动OCR识别、批量实体抽取、批量导出专题数据集
+理由：OCR大图耗时久，如果同步会超时卡死；丢消息到队列，后台消费处理，完成后回调通知，用户不用一直等待，提升可用性。
+
+---
+## 问题2：数据层概念与逻辑模型设计
+### 1. E-R模型（实体-属性-关系清单）
+| 实体 | 主键 | 属性 | 关系 |
+| ---- | ---- | ---- | ---- |
+| 用户 | user_id | user_name、password_hash、role（管理员/研究员/访客）、department | 一对多：用户 → 操作日志；一对多：用户 → 标注记录 |
+| 古籍主表 | book_id | book_name、author、dynastic、security_level（开放/校内/涉密）、resource_type、create_time | 一对多：古籍 → 影像文件；一对多：古籍 → OCR文本；一对多：古籍 → 标注记录 |
+| 影像文件表 | img_id | book_id（外键）、file_path、file_hash、file_size、upload_time | 多对一：影像文件 → 古籍 |
+| OCR文本表 | ocr_id | book_id（外键）、img_id、ocr_content、confidence、ocr_engine、create_time | 多对一：OCR文本 → 古籍 |
+| 标注记录表 | annotate_id | book_id（外键）、user_id（外键）、entity_type、entity_text、position、status（待审核/通过/驳回）、annotate_time | 多对一：标注记录 → 古籍；多对一：标注记录 → 用户 |
+| 用户权限表 | perm_id | user_id（外键）、book_id、perm_type（浏览/编辑/导出） | 多对一：权限 → 用户；多对一：权限 → 古籍 |
+| 操作日志表 | log_id | user_id（外键）、book_id、operate_type、operate_detail、operate_time、ip_addr | 多对一：日志 → 用户；多对一：日志 → 古籍 |
+
+> 关系总结：
+> 1 用户可以有多条标注、多条操作日志；
+> 1 古籍有多张影像、多条OCR文本、多条标注；
+> 权限表单独做，实现古籍粒度权限控制，满足三级隔离。
+
+### 2. 核心数据表设计（MySQL风格）
+#### ① 古籍主表 `ancient_book`
+| 字段 | 类型 | 约束 | 说明 |
+| ---- | ---- | ---- | ---- |
+| book_id | varchar(64) | PRIMARY KEY, NOT NULL | 古籍唯一ID |
+| book_name | varchar(255) | NOT NULL, INDEX | 古籍名称 |
+| author | varchar(128) | NULL | 作者 |
+| dynasty | varchar(64) | NULL, INDEX | 朝代 |
+| security_level | varchar(32) | NOT NULL, INDEX | open / campus / secret |
+| resource_type | varchar(64) | NOT NULL | 古籍、方志、族谱 |
+| create_time | datetime | NOT NULL | 创建时间 |
+| update_time | datetime | NOT NULL | 修改时间 |
+
+#### ② 影像文件表 `book_image`
+| 字段 | 类型 | 约束 | 说明 |
+| ---- | ---- | ---- | ---- |
+| img_id | varchar(64) | PRIMARY KEY, NOT NULL | 影像id |
+| book_id | varchar(64) | FOREIGN KEY, NOT NULL, INDEX | 关联古籍 |
+| file_path | varchar(512) | NOT NULL | 对象存储路径（OSS路径） |
+| file_hash | varchar(128) | NOT NULL, UNIQUE | 文件md5防重复 |
+| file_size | bigint | NOT NULL | 文件字节大小 |
+| upload_time | datetime | NOT NULL | 上传时间 |
+
+#### ③ OCR文本表 `ocr_text`
+| 字段 | 类型 | 约束 | 说明 |
+| ---- | ---- | ---- | ---- |
+| ocr_id | varchar(64) | PRIMARY KEY, NOT NULL | OCR记录id |
+| book_id | varchar(64) | FOREIGN KEY, NOT NULL, INDEX | 古籍id |
+| img_id | varchar(64) | FOREIGN KEY, NOT NULL | 对应影像 |
+| ocr_content | text | NOT NULL | OCR识别全文 |
+| confidence | decimal(4,3) | NULL | 置信度 |
+| ocr_engine | varchar(64) | NOT NULL | OCR引擎标识 |
+| create_time | datetime | NOT NULL | 识别时间 |
+
+#### ④ 标注记录表 `annotate_record`
+| 字段 | 类型 | 约束 | 说明 |
+| ---- | ---- | ---- | ---- |
+| annotate_id | varchar(64) | PRIMARY KEY, NOT NULL | 标注ID |
+| book_id | varchar(64) | FOREIGN KEY, NOT NULL, INDEX | 古籍 |
+| user_id | varchar(64) | FOREIGN KEY, NOT NULL, INDEX | 标注人 |
+| entity_type | varchar(64) | NOT NULL | 人名/地名 |
+| entity_text | varchar(128) | NOT NULL | 实体内容 |
+| position | varchar(255) | NULL | 在文本中的位置 |
+| status | varchar(32) | NOT NULL, INDEX | pending / pass / reject |
+| annotate_time | datetime | NOT NULL | 标注时间 |
+
+#### ⑤ 用户权限表 `user_permission`
+| 字段 | 类型 | 约束 | 说明 |
+| ---- | ---- | ---- | ---- |
+| perm_id | varchar(64) | PRIMARY KEY, NOT NULL | 权限ID |
+| user_id | varchar(64) | FOREIGN KEY, NOT NULL, INDEX | 用户 |
+| book_id | varchar(64) | FOREIGN KEY, NOT NULL, INDEX | 古籍 |
+| perm_type | varchar(32) | NOT NULL | view / edit / export |
+| create_time | datetime | NOT NULL | 授权时间 |
+
+#### ⑥ 操作日志表 `operate_log`
+| 字段 | 类型 | 约束 | 说明 |
+| ---- | ---- | ---- | ---- |
+| log_id | varchar(64) | PRIMARY KEY, NOT NULL | 日志ID |
+| user_id | varchar(64) | FOREIGN KEY, NOT NULL, INDEX | 操作人 |
+| book_id | varchar(64) | FOREIGN KEY, NOT NULL, INDEX | 操作古籍 |
+| operate_type | varchar(64) | NOT NULL | 新增/修改/审核/导出 |
+| operate_detail | text | NULL | 修改详情 |
+| operate_time | datetime | NOT NULL, INDEX | 操作时间 |
+| ip_addr | varchar(64) | NULL | 客户端IP |
+
+### 3. 为什么古籍影像文件不直接存入数据库？
+1. **性能问题**：古籍扫描大图体积巨大（几十MB~几百MB），数据库存储大二进制BLOB会让数据表膨胀、索引变慢、查询卡顿，备份恢复速度极慢；
+2. **存储成本与扩展性**：对象存储（OSS/文件服务）专门为大文件设计，支持分片、CDN加速、权限独立控制，数据库不适合做海量静态文件分发；
+3. **解耦需求**：题目约束影像、元数据、OCR分开存储；文件交给独立存储服务，数据库只存文件路径，方便后续替换存储方案；
+4. **并发访问**：大量用户浏览图片时，文件服务的吞吐能力远高于数据库；
+5. **备份迁移**：文件和数据库可以分开迁移、单独扩容，互不影响。
+
+---
+# 完整md一键复制版（直接提交github）
+```markdown
+# 地方古籍文献数字化平台设计作业
+## 题目背景
+某高校数字人文研究中心搭建地方古籍文献数字化平台，支持古籍影像上传、OCR识别、实体标注、检索、权限隔离，面向档案管理员、研究人员、匿名访客、上层系统对接。
+约束：影像文件、OCR文本、元数据分离存储；三级权限隔离；OCR和标注为独立可复用服务；操作留痕；低耦合，支持替换OCR引擎、数据库；支持后续新增方志、族谱类型。
+
+## 问题1：面向服务设计
+### 1. 服务清单
+#### 基础能力服务
+- 文件存储服务：古籍影像上传、访问、元信息管理
+- OCR识别服务：图片文字识别，独立可复用，支持引擎替换
+- 实体标注服务：实体抽取、标注CRUD
+- 身份权限服务：认证、三级权限校验
+- 操作日志服务：统一记录操作留痕
+- 检索服务：全文检索、条件检索
+
+#### 业务服务
+- 古籍著录服务：古籍元数据新增、修改、审核
+- 标注审核服务：标注提交、管理员审核
+- 数据集导出服务：专题数据集导出
+- 古籍浏览服务：权限控制预览浏览
+- 资源类型管理服务：扩展方志、族谱等资源
+
+#### 编排服务
+- 古籍上传编排服务：上传影像→存储→异步OCR→写入元数据
+- 标注流程编排服务：加载OCR→标注→提交审核→日志留痕
+
+### 2. 接口契约（2个服务）
+#### 服务1：OCR识别服务（基础能力）
+职责：接收图片地址，返回识别文本，无业务耦合，可替换OCR引擎
+入参
+```json
+{
+  "taskId": "string",
+  "fileUrl": "string",
+  "imgHash": "string",
+  "callbackUrl": "string"
+}
+```
+出参
+```json
+{
+  "code": 200,
+  "msg": "success",
+  "data": {
+    "ocrText": "string",
+    "confidence": 0.92,
+    "taskId": "string"
+  }
+}
+```
+异常返回
+```json
+{
+  "code": 5001,
+  "msg": "OCR引擎识别失败",
+  "data": {
+    "taskId": "string",
+    "reason": "图片模糊/格式不支持"
+  }
+}
+```
+
+#### 服务2：古籍著录服务（业务服务）
+职责：古籍元数据新增编辑，权限校验，自动写入操作日志
+入参
+```json
+{
+  "ancientBookId": "string",
+  "bookName": "string",
+  "author": "string",
+  "publishYear": "string",
+  "securityLevel": "open|campus|secret",
+  "uploadUserId": "string"
+}
+```
+出参
+```json
+{
+  "code": 200,
+  "msg": "success",
+  "data": {
+    "ancientBookId": "string",
+    "updateTime": "2026-11-20 18:00:00"
+  }
+}
+```
+异常返回
+```json
+{
+  "code": 4031,
+  "msg": "权限不足，无法编辑涉密古籍",
+  "data": {
+    "userId": "string",
+    "securityLevel": "secret"
+  }
+}
+```
+
+### 3. 服务解耦 & 同步异步选择
+解耦手段：
+1. 基于标准JSON接口通信，不共享数据表；
+2. OCR、存储、标注为独立服务，上层编排调用，底层实现可替换；
+3. 影像、OCR文本、元数据物理分离存储；
+4. 使用消息队列实现异步任务解耦。
+
+同步调用场景：用户鉴权、权限校验、古籍元数据查询。理由：请求需要即时返回结果，用户等待短，强一致性。
+异步消息队列场景：大图OCR识别、批量实体抽取、批量数据集导出。理由：任务耗时久，同步容易超时；后台消费，用户无需阻塞等待。
+
+## 问题2：数据层概念与逻辑模型设计
+### 1. E-R实体关系清单
+- 用户(user_id PK)：用户名、角色；一对多：标注记录、操作日志
+- 古籍主表(book_id PK)：书名、作者、密级、资源类型；一对多：影像、OCR、标注
+- 影像文件表(img_id PK)：book_id(FK)、存储路径、哈希；多对一：古籍
+- OCR文本表(ocr_id PK)：book_id(FK)、img_id(FK)、识别文本；多对一：古籍
+- 标注记录(annotate_id PK)：book_id(FK)、user_id(FK)、实体内容、审核状态；多对一：古籍、用户
+- 用户权限表(perm_id PK)：user_id(FK)、book_id(FK)、权限类型；多对一：用户、古籍
+- 操作日志(log_id PK)：user_id(FK)、book_id(FK)、操作详情；多对一：用户、古籍
+
+### 2. 核心数据表设计
+#### ancient_book 古籍主表
+book_id varchar(64) PK NOT NULL;
+book_name varchar(255) NOT NULL INDEX;
+author varchar(128);
+dynasty varchar(64) INDEX;
+security_level varchar(32) NOT NULL INDEX;
+resource_type varchar(64) NOT NULL;
+create_time datetime NOT NULL;
+update_time datetime NOT NULL;
+
+#### book_image 影像文件表
+img_id varchar(64) PK NOT NULL;
+book_id varchar(64) FK NOT NULL INDEX;
+file_path varchar(512) NOT NULL;
+file_hash varchar(128) NOT NULL UNIQUE;
+file_size bigint NOT NULL;
+upload_time datetime NOT NULL;
+
+#### ocr_text OCR文本表
+ocr_id varchar(64) PK NOT NULL;
+book_id varchar(64) FK NOT NULL INDEX;
+img_id varchar(64) FK NOT NULL;
+ocr_content text NOT NULL;
+confidence decimal(4,3);
+ocr_engine varchar(64) NOT NULL;
+create_time datetime NOT NULL;
+
+#### annotate_record 标注记录表
+annotate_id varchar(64) PK NOT NULL;
+book_id varchar(64) FK NOT NULL INDEX;
+user_id varchar(64) FK NOT NULL INDEX;
+entity_type varchar(64) NOT NULL;
+entity_text varchar(128) NOT NULL;
+position varchar(255);
+status varchar(32) NOT NULL INDEX;
+annotate_time datetime NOT NULL;
+
+#### user_permission 用户权限表
+perm_id varchar(64) PK NOT NULL;
+user_id varchar(64) FK NOT NULL INDEX;
+book_id varchar(64) FK NOT NULL INDEX;
+perm_type varchar(32) NOT NULL;
+create_time datetime NOT NULL;
+
+#### operate_log 操作日志表
+log_id varchar(64) PK NOT NULL;
+user_id varchar(64) FK NOT NULL INDEX;
+book_id varchar(64) FK NOT NULL INDEX;
+operate_type varchar(64) NOT NULL;
+operate_detail text;
+operate_time datetime NOT NULL INDEX;
+ip_addr varchar(64);
+
+### 3. 影像文件不存入数据库的原因
+古籍扫描影像文件体积巨大，存入BLOB字段会造成数据表膨胀，数据库查询、备份、索引性能急剧下降；
+文件存储交给独立对象存储服务，支持CDN、分片上传、独立权限控制，数据库只保存文件路径；
+满足题目“影像、元数据、OCR分开存储”的解耦要求，文件系统和数据库可以分别扩容、迁移；
+海量并发图片浏览场景下，对象存储吞吐能力远优于数据库。
+```
